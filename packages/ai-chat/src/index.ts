@@ -1302,7 +1302,11 @@ export class AIChatAgent<
     }
 
     const sanitized = this._sanitizeMessageForPersistence(message);
-    return JSON.stringify(sanitized.parts);
+    const key = sanitized.parts
+      .filter((part) => part.type === "text")
+      .map((part) => (part as { text: string }).text)
+      .join("");
+    return key || undefined;
   }
 
   /**
