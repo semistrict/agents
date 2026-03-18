@@ -113,7 +113,8 @@ export function applyChunkToParts(
       parts.push({
         type: "reasoning",
         text: "",
-        state: "streaming"
+        state: "streaming",
+        ...(chunk.providerMetadata && { providerMetadata: chunk.providerMetadata }),
       } as MessagePart);
       return true;
     }
@@ -137,6 +138,14 @@ export function applyChunkToParts(
       const lastReasoningPart = findLastPartByType(parts, "reasoning");
       if (lastReasoningPart && "state" in lastReasoningPart) {
         (lastReasoningPart as { state: string }).state = "done";
+        // The reasoning-end chunk carries the final providerMetadata with
+        // accumulated reasoning_details (including signatures). Without this,
+        // the persisted reasoning part has no signature, causing Anthropic to
+        // reject the message on replay with "Invalid signature in thinking block".
+        if (chunk.providerMetadata) {
+          (lastReasoningPart as { providerMetadata?: unknown }).providerMetadata =
+            chunk.providerMetadata;
+        }
       }
       return true;
     }

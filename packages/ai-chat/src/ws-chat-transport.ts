@@ -11,6 +11,7 @@
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { nanoid } from "nanoid";
 import { MessageType, type OutgoingMessage } from "./types";
+import { deduplicateConsecutiveAssistants } from "./message-dedup";
 
 /**
  * Agent-like interface for sending/receiving WebSocket messages.
@@ -110,6 +111,7 @@ export class WebSocketChatTransport<
     metadata?: unknown;
   }): Promise<ReadableStream<UIMessageChunk>> {
     const requestId = nanoid(8);
+    const assistantMessageId = nanoid();
     const abortController = new AbortController();
     let completed = false;
 
@@ -129,11 +131,39 @@ export class WebSocketChatTransport<
       };
     }
 
-    const bodyPayload = JSON.stringify({
-      messages: options.messages,
+    const normalizedMessages = deduplicateConsecutiveAssistants(
+      options.messages
+    );
+
+    console.info("[ai-chat]", "transport sendMessages", {
+      requestId,
+      assistantMessageId,
       trigger: options.trigger,
-      ...extraBody
+      messageCount: normalizedMessages.length,
+      messages: normalizedMessages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        partTypes: m.parts.map((p) => p.type),
+        hasFinishReason: !!(
+          m.metadata as { finishReason?: unknown } | undefined
+        )?.finishReason
+      }))
     });
+
+    const bodyPayload = JSON.stringify({
+      ...extraBody,
+      messages: normalizedMessages,
+      trigger: options.trigger,
+      assistantMessageId
+    });
+
+    console.info("[ai-chat]", "transport bodyPayload", {
+      requestId,
+      assistantMessageId,
+      extraBodyKeys: Object.keys(extraBody),
+      bodyPayload: JSON.parse(bodyPayload)
+    }
+    );
 
     // Track this request so the onAgentMessage handler skips it
     this.activeRequestIds?.add(requestId);
@@ -184,6 +214,15 @@ export class WebSocketChatTransport<
     const stream = new ReadableStream<UIMessageChunk>({
       start(controller) {
         streamController = controller;
+
+        // Seed the local AI SDK stream with the canonical assistant message ID
+        // immediately. This keeps the sender tab's optimistic assistant
+        // message aligned with the server-persisted message even if the
+        // provider's start chunk is delayed or carries a different ID.
+        controller.enqueue({
+          type: "start",
+          messageId: assistantMessageId
+        } as UIMessageChunk);
 
         const onMessage = (event: MessageEvent) => {
           try {

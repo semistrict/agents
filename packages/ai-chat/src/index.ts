@@ -180,6 +180,21 @@ export function createToolsFromClientSchemas(
 
 const decoder = new TextDecoder();
 
+function summarizeMessages(messages: ChatMessage[]) {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    partTypes: message.parts.map((part) => part.type),
+    hasFinishReason: !!(
+      message.metadata as { finishReason?: unknown } | undefined
+    )?.finishReason
+  }));
+}
+
+function logAiChat(msg: string, extra: Record<string, unknown> = {}) {
+  console.info("[ai-chat]", msg, extra);
+}
+
 /**
  * Extension of Agent with built-in chat capabilities
  * @template Env Environment type containing bindings
@@ -214,6 +229,7 @@ export class AIChatAgent<
    * @internal
    */
   private _approvalPersistedMessageId: string | null = null;
+  private _orphanPersistedMessageId: string | null = null;
 
   /**
    * Promise that resolves when the current stream completes.
@@ -422,11 +438,13 @@ export class AIChatAgent<
           const {
             messages,
             clientTools,
+            assistantMessageId,
             trigger: _trigger,
             ...customBody
           } = parsed as {
             messages: ChatMessage[];
             clientTools?: ClientToolSchema[];
+            assistantMessageId?: string;
             trigger?: string;
             [key: string]: unknown;
           };
@@ -439,6 +457,16 @@ export class AIChatAgent<
 
           // Automatically transform any incoming messages
           const transformedMessages = autoTransformMessages(messages);
+
+          logAiChat("server received CF_AGENT_USE_CHAT_REQUEST", {
+            requestId: data.id,
+            assistantMessageId,
+            connectionId: connection.id,
+            incomingCount: transformedMessages.length,
+            serverCountBeforePersist: this.messages.length,
+            messages: summarizeMessages(transformedMessages),
+            serverMessages: summarizeMessages(this.messages)
+          });
 
           this._broadcastChatMessage(
             {
@@ -478,6 +506,7 @@ export class AIChatAgent<
 
                 if (response) {
                   await this._reply(data.id, response, [connection.id], {
+                    assistantMessageId,
                     chatMessageId
                   });
                 } else {
@@ -521,6 +550,13 @@ export class AIChatAgent<
         // Handle message replacement
         if (data.type === MessageType.CF_AGENT_CHAT_MESSAGES) {
           const transformedMessages = autoTransformMessages(data.messages);
+          logAiChat("server received CF_AGENT_CHAT_MESSAGES", {
+            connectionId: connection.id,
+            incomingCount: transformedMessages.length,
+            serverCountBeforePersist: this.messages.length,
+            messages: summarizeMessages(transformedMessages),
+            serverMessages: summarizeMessages(this.messages)
+          });
           await this.persistMessages(transformedMessages, [connection.id]);
           return;
         }
@@ -537,6 +573,14 @@ export class AIChatAgent<
         // avoiding the race condition where CF_AGENT_STREAM_RESUMING sent
         // in onConnect arrives before the client's handler is ready.
         if (data.type === MessageType.CF_AGENT_STREAM_RESUME_REQUEST) {
+          logAiChat("server received CF_AGENT_STREAM_RESUME_REQUEST", {
+            connectionId: connection.id,
+            requestId: data.id,
+            hasActiveStream: this._resumableStream.hasActiveStream(),
+            activeRequestId: this._resumableStream.activeRequestId,
+            activeStreamId: this._resumableStream.activeStreamId,
+            isLive: this._resumableStream.isLive
+          });
           if (this._resumableStream.hasActiveStream()) {
             this._notifyStreamResuming(connection);
           } else {
@@ -551,6 +595,14 @@ export class AIChatAgent<
 
         // Handle stream resume acknowledgment
         if (data.type === MessageType.CF_AGENT_STREAM_RESUME_ACK) {
+          logAiChat("server received CF_AGENT_STREAM_RESUME_ACK", {
+            connectionId: connection.id,
+            requestId: data.id,
+            hasActiveStream: this._resumableStream.hasActiveStream(),
+            activeRequestId: this._resumableStream.activeRequestId,
+            activeStreamId: this._resumableStream.activeStreamId,
+            isLive: this._resumableStream.isLive
+          });
           this._pendingResumeConnections.delete(connection.id);
 
           if (
@@ -561,6 +613,12 @@ export class AIChatAgent<
               connection,
               this._resumableStream.activeRequestId
             );
+
+            logAiChat("server replayChunks result", {
+              connectionId: connection.id,
+              requestId: data.id,
+              orphanedStreamId
+            });
 
             // If the stream was orphaned (restored from SQLite after
             // hibernation with no live reader), reconstruct the partial
@@ -767,6 +825,13 @@ export class AIChatAgent<
       return;
     }
 
+    logAiChat("server notify stream resuming", {
+      connectionId: connection.id,
+      activeRequestId: this._resumableStream.activeRequestId,
+      activeStreamId: this._resumableStream.activeStreamId,
+      isLive: this._resumableStream.isLive
+    });
+
     // Add connection to pending set - they'll be excluded from live broadcasts
     // until they send ACK to receive the full stream replay
     this._pendingResumeConnections.add(connection.id);
@@ -844,9 +909,14 @@ export class AIChatAgent<
       parts: []
     };
 
+    let hasFinishEvent = false;
     for (const chunk of chunks) {
       try {
         const data = JSON.parse(chunk.body);
+
+        if (data.type === "finish") {
+          hasFinishEvent = true;
+        }
 
         // Capture message ID from the "start" event if present
         if (data.type === "start" && data.messageId != null) {
@@ -869,7 +939,27 @@ export class AIChatAgent<
       }
     }
 
+    // If the chunks contain a "finish" event, the stream completed normally
+    // and _reply will persist the final message. Skip orphan persistence to
+    // avoid creating a duplicate assistant message.
+    if (hasFinishEvent) {
+      logAiChat("server skip orphan persist because finish event exists", {
+        streamId,
+        chunkCount: chunks.length,
+        messageId: message.id,
+        partTypes: message.parts.map((part) => part.type)
+      });
+      return;
+    }
+
     if (message.parts.length > 0) {
+      logAiChat("server persist orphaned stream message", {
+        streamId,
+        chunkCount: chunks.length,
+        messageId: message.id,
+        partTypes: message.parts.map((part) => part.type),
+        existingMessageIds: this.messages.map((msg) => msg.id)
+      });
       // Check if a message with this ID already exists (e.g., from an
       // early persist during tool approval). Update in place if so.
       const existingIdx = this.messages.findIndex((m) => m.id === message.id);
@@ -878,6 +968,9 @@ export class AIChatAgent<
           ? this.messages.map((m, i) => (i === existingIdx ? message : m))
           : [...this.messages, message];
       this.persistMessages(updatedMessages);
+      // Track the orphaned message ID so _reply can replace it instead of
+      // appending a duplicate when the stream eventually completes.
+      this._orphanPersistedMessageId = message.id;
     }
   }
 
@@ -1060,7 +1153,19 @@ export class AIChatAgent<
     // Merge incoming messages with existing server state to preserve tool outputs.
     // This is critical for client-side tools: the client sends messages without
     // tool outputs, but the server has them via _applyToolResult.
-    const mergedMessages = this._mergeIncomingWithServerState(messages);
+    const mergedMessages = this._deduplicateAssistantMessages(
+      this._mergeIncomingWithServerState(messages)
+    );
+
+    logAiChat("server persistMessages", {
+      incomingCount: messages.length,
+      mergedCount: mergedMessages.length,
+      excludeBroadcastIds,
+      deleteStaleRows: options?._deleteStaleRows === true,
+      incomingMessages: summarizeMessages(messages),
+      mergedMessages: summarizeMessages(mergedMessages),
+      serverMessagesBeforePersist: summarizeMessages(this.messages)
+    });
 
     // Persist only new or changed messages (incremental persistence).
     // Compares serialized JSON against a cache of last-persisted versions.
@@ -1121,9 +1226,13 @@ export class AIChatAgent<
     // refresh in-memory messages
     const persisted = this._loadMessagesFromDb();
     this.messages = autoTransformMessages(persisted);
+    logAiChat("server persistMessages complete", {
+      inMemoryCount: this.messages.length,
+      messages: summarizeMessages(this.messages)
+    });
     this._broadcastChatMessage(
       {
-        messages: mergedMessages,
+        messages: this.messages,
         type: MessageType.CF_AGENT_CHAT_MESSAGES
       },
       excludeBroadcastIds
@@ -1302,7 +1411,65 @@ export class AIChatAgent<
     }
 
     const sanitized = this._sanitizeMessageForPersistence(message);
-    return JSON.stringify(sanitized.parts);
+    const key = sanitized.parts
+      .filter((part) => part.type === "text")
+      .map((part) => (part as { text: string }).text)
+      .join("");
+    return key || undefined;
+  }
+
+  /**
+   * Remove duplicate assistant messages that have identical text content.
+   *
+   * The client-side useAgentChat hook can send both a streaming placeholder
+   * (with an `assistant_*` ID built from stream chunks) and the final
+   * server-persisted message (with metadata.finishReason). When both arrive
+   * in the same request, _reconcileAssistantIdsWithServerState maps the
+   * first one to the server ID but lets the second through as a new row.
+   *
+   * This pass collapses such pairs: when two adjacent assistant messages
+   * share the same text, keep the one with `metadata.finishReason` (the
+   * authoritative server message), or the last one if neither has it.
+   */
+  private _deduplicateAssistantMessages(
+    messages: ChatMessage[]
+  ): ChatMessage[] {
+    const result: ChatMessage[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const next = messages[i + 1];
+
+      // Check if this message and the next are both assistant with same text
+      if (
+        msg.role === "assistant" &&
+        next?.role === "assistant" &&
+        !this._hasToolCallPart(msg) &&
+        !this._hasToolCallPart(next)
+      ) {
+        const keyA = this._assistantMessageContentKey(msg);
+        const keyB = this._assistantMessageContentKey(next);
+
+        if (keyA && keyA === keyB) {
+          // Keep the one with finishReason (the final server message).
+          // If both or neither have it, keep the second one.
+          const aHasFinish = !!(msg.metadata as Record<string, unknown> | undefined)?.finishReason;
+          const bHasFinish = !!(next.metadata as Record<string, unknown> | undefined)?.finishReason;
+
+          if (aHasFinish && !bHasFinish) {
+            result.push(msg);
+          } else {
+            result.push(next);
+          }
+          i++; // skip next
+          continue;
+        }
+      }
+
+      result.push(msg);
+    }
+
+    return result;
   }
 
   /**
@@ -1392,7 +1559,7 @@ export class AIChatAgent<
    * @returns A new message with ephemeral provider data removed
    */
   private _sanitizeMessageForPersistence(message: ChatMessage): ChatMessage {
-    // First, strip OpenAI-specific ephemeral data from all parts
+    // First, strip provider-specific ephemeral data from all parts
     const strippedParts = message.parts.map((part) => {
       let sanitizedPart = part;
 
@@ -1422,14 +1589,62 @@ export class AIChatAgent<
         );
       }
 
+      // OpenRouter reasoning_details belong on reasoning parts, not tool parts.
+      // If they are persisted on a tool part and replayed later, Anthropic can
+      // reject the conversation with "Invalid signature in thinking block".
+      if (
+        sanitizedPart.type.startsWith("tool-") &&
+        "callProviderMetadata" in sanitizedPart &&
+        sanitizedPart.callProviderMetadata &&
+        typeof sanitizedPart.callProviderMetadata === "object" &&
+        "openrouter" in sanitizedPart.callProviderMetadata
+      ) {
+        sanitizedPart = this._stripOpenRouterReasoningMetadata(
+          sanitizedPart,
+          "callProviderMetadata"
+        );
+      }
+
+      if (
+        sanitizedPart.type.startsWith("tool-") &&
+        "providerMetadata" in sanitizedPart &&
+        sanitizedPart.providerMetadata &&
+        typeof sanitizedPart.providerMetadata === "object" &&
+        "openrouter" in sanitizedPart.providerMetadata
+      ) {
+        sanitizedPart = this._stripOpenRouterReasoningMetadata(
+          sanitizedPart,
+          "providerMetadata"
+        );
+      }
+
       return sanitizedPart;
     }) as ChatMessage["parts"];
+
+    const normalizedReasoningParts =
+      this._mergeSplitOpenRouterReasoningParts(strippedParts);
 
     // Then filter out reasoning parts that are truly empty (no text and no
     // remaining providerMetadata). This removes OpenAI placeholders whose
     // metadata was just stripped, while preserving provider-specific blocks
     // like Anthropic's redacted_thinking that carry data in providerMetadata.
-    const sanitizedParts = strippedParts.filter((part) => {
+    const hasToolPart = normalizedReasoningParts.some((part) =>
+      part.type.startsWith("tool-")
+    );
+
+    const sanitizedParts = normalizedReasoningParts.filter((part) => {
+      // Anthropic/OpenRouter tool turns are not replay-safe when the same
+      // assistant message also contains signed reasoning blocks. Drop the
+      // reasoning parts for tool-containing assistant messages and keep the
+      // visible text + tool call/result chain.
+      if (
+        hasToolPart &&
+        message.role === "assistant" &&
+        part.type === "reasoning"
+      ) {
+        return false;
+      }
+
       if (part.type === "reasoning") {
         const reasoningPart = part as ReasoningUIPart;
         if (!reasoningPart.text || reasoningPart.text.trim() === "") {
@@ -1448,6 +1663,100 @@ export class AIChatAgent<
     });
 
     return { ...message, parts: sanitizedParts };
+  }
+
+  private _mergeSplitOpenRouterReasoningParts(
+    parts: ChatMessage["parts"]
+  ): ChatMessage["parts"] {
+    const merged = [...parts];
+    const toRemove = new Set<number>();
+
+    for (let i = 0; i < merged.length; i++) {
+      const part = merged[i];
+      if (part.type !== "reasoning") {
+        continue;
+      }
+
+      const reasoningPart = part as ReasoningUIPart;
+      const details = this._getOpenRouterReasoningDetails(reasoningPart);
+      if (
+        !details ||
+        reasoningPart.text.trim() !== "" ||
+        !details.some((detail) => typeof detail.signature === "string")
+      ) {
+        continue;
+      }
+
+      for (let j = i - 1; j >= 0; j--) {
+        const candidate = merged[j];
+        if (candidate.type !== "reasoning") {
+          continue;
+        }
+
+        if (
+          this._isSplitOpenRouterReasoningPair(
+            candidate as ReasoningUIPart,
+            reasoningPart
+          )
+        ) {
+          merged[j] = {
+            ...(candidate as ReasoningUIPart),
+            providerMetadata: reasoningPart.providerMetadata
+          } as ChatMessage["parts"][number];
+          toRemove.add(i);
+          break;
+        }
+      }
+    }
+
+    return merged.filter((_, index) => !toRemove.has(index));
+  }
+
+  private _isSplitOpenRouterReasoningPair(
+    current: ReasoningUIPart,
+    next: ReasoningUIPart
+  ): boolean {
+    if (!current.text || current.text.trim() === "") {
+      return false;
+    }
+    if (next.text && next.text.trim() !== "") {
+      return false;
+    }
+
+    const currentDetails = this._getOpenRouterReasoningDetails(current);
+    const nextDetails = this._getOpenRouterReasoningDetails(next);
+    if (!currentDetails || !nextDetails) {
+      return false;
+    }
+
+    const currentWithoutSignatures = currentDetails.map(
+      ({ signature: _signature, ...rest }) => rest
+    );
+    const nextWithoutSignatures = nextDetails.map(
+      ({ signature: _signature, ...rest }) => rest
+    );
+
+    const sameLogicalReasoning =
+      JSON.stringify(currentWithoutSignatures) ===
+      JSON.stringify(nextWithoutSignatures);
+
+    return (
+      sameLogicalReasoning &&
+      nextDetails.some((detail) => typeof detail.signature === "string")
+    );
+  }
+
+  private _getOpenRouterReasoningDetails(part: ReasoningUIPart):
+    | Array<Record<string, unknown> & { signature?: string }>
+    | undefined {
+    const metadata = part.providerMetadata as
+      | {
+          openrouter?: {
+            reasoning_details?: Array<Record<string, unknown> & { signature?: string }>;
+          };
+        }
+      | undefined;
+    return metadata?.openrouter?.reasoning_details;
   }
 
   /**
@@ -1489,6 +1798,48 @@ export class AIChatAgent<
     }
 
     // Create new part without the old metadata
+    const { [metadataKey]: _oldMeta, ...restPart } = part as Record<
+      string,
+      unknown
+    >;
+
+    if (newMetadata) {
+      return { ...restPart, [metadataKey]: newMetadata } as T;
+    }
+    return restPart as T;
+  }
+
+  /**
+   * Remove OpenRouter reasoning_details from tool metadata. These details are
+   * only valid on reasoning parts; replaying them from tool metadata can
+   * produce invalid Anthropic thinking blocks on subsequent turns.
+   */
+  private _stripOpenRouterReasoningMetadata<
+    T extends ChatMessage["parts"][number]
+  >(part: T, metadataKey: "providerMetadata" | "callProviderMetadata"): T {
+    const metadata = (part as Record<string, unknown>)[metadataKey] as {
+      openrouter?: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+
+    if (!metadata?.openrouter) return part;
+
+    const { reasoning_details: _reasoningDetails, ...restOpenRouter } =
+      metadata.openrouter;
+
+    const hasOtherOpenRouterFields = Object.keys(restOpenRouter).length > 0;
+    const { openrouter: _openrouter, ...restMetadata } = metadata;
+
+    let newMetadata: ProviderMetadata | undefined;
+    if (hasOtherOpenRouterFields) {
+      newMetadata = {
+        ...restMetadata,
+        openrouter: restOpenRouter
+      } as ProviderMetadata;
+    } else if (Object.keys(restMetadata).length > 0) {
+      newMetadata = restMetadata as ProviderMetadata;
+    }
+
     const { [metadataKey]: _oldMeta, ...restPart } = part as Record<
       string,
       unknown
@@ -1834,7 +2185,8 @@ export class AIChatAgent<
     message: ChatMessage,
     streamCompleted: { value: boolean },
     continuation = false,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    assistantMessageId?: string
   ) {
     streamCompleted.value = false;
 
@@ -1887,6 +2239,35 @@ export class AIChatAgent<
             // It handles: text, reasoning, file, source, tool lifecycle,
             // step boundaries — all the part types needed for UIMessage.
             const handled = applyChunkToParts(message.parts, data);
+
+            if (data.type === "start") {
+              if (assistantMessageId != null) {
+                message.id = assistantMessageId;
+              } else if (data.messageId != null) {
+                message.id = data.messageId;
+              }
+              if (data.messageMetadata != null) {
+                message.metadata = message.metadata
+                  ? { ...message.metadata, ...data.messageMetadata }
+                  : data.messageMetadata;
+              }
+            }
+
+            if (
+              (data.type === "finish" || data.type === "message-metadata") &&
+              data.messageMetadata != null
+            ) {
+              message.metadata = message.metadata
+                ? { ...message.metadata, ...data.messageMetadata }
+                : data.messageMetadata;
+            }
+
+            if (data.type === "finish" && "finishReason" in data) {
+              message.metadata = {
+                ...(message.metadata ?? {}),
+                finishReason: data.finishReason
+              };
+            }
 
             // When a tool enters approval-requested state, the stream is
             // paused waiting for user approval. Persist the streaming message
@@ -1979,24 +2360,8 @@ export class AIChatAgent<
             // Handle server-specific chunk types not covered by the shared parser
             if (!handled) {
               switch (data.type) {
-                case "start": {
-                  if (data.messageId != null) {
-                    message.id = data.messageId;
-                  }
-                  if (data.messageMetadata != null) {
-                    message.metadata = message.metadata
-                      ? { ...message.metadata, ...data.messageMetadata }
-                      : data.messageMetadata;
-                  }
-                  break;
-                }
                 case "finish":
                 case "message-metadata": {
-                  if (data.messageMetadata != null) {
-                    message.metadata = message.metadata
-                      ? { ...message.metadata, ...data.messageMetadata }
-                      : data.messageMetadata;
-                  }
                   break;
                 }
                 case "finish-step": {
@@ -2034,6 +2399,18 @@ export class AIChatAgent<
             }
 
             // Store chunk for replay and broadcast to clients
+            if (
+              assistantMessageId != null &&
+              typeof eventToSend === "object" &&
+              eventToSend != null &&
+              "type" in eventToSend &&
+              (eventToSend as { type?: unknown }).type === "start"
+            ) {
+              eventToSend = {
+                ...(eventToSend as Record<string, unknown>),
+                messageId: assistantMessageId
+              };
+            }
             const chunkBody = JSON.stringify(eventToSend);
             this._storeStreamChunk(streamId, chunkBody);
             this._broadcastChatMessage({
@@ -2211,9 +2588,14 @@ export class AIChatAgent<
     id: string,
     response: Response,
     excludeBroadcastIds: string[] = [],
-    options: { continuation?: boolean; chatMessageId?: string } = {}
+    options: {
+      continuation?: boolean;
+      chatMessageId?: string;
+      assistantMessageId?: string;
+    } = {}
   ) {
-    const { continuation = false, chatMessageId } = options;
+    const { continuation = false, chatMessageId, assistantMessageId } =
+      options;
     // Look up the abort signal for this request so we can cancel the reader
     // loop if the client sends a cancel message. This is a safety net —
     // users should also pass abortSignal to streamText for proper cancellation.
@@ -2244,10 +2626,19 @@ export class AIChatAgent<
         // Parsing state adapted from:
         // https://github.com/vercel/ai/blob/main/packages/ai/src/ui-message-stream/ui-message-chunks.ts#L295
         const message: ChatMessage = {
-          id: `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`, // default
+          id:
+            assistantMessageId ??
+            `assistant_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
           role: "assistant",
           parts: []
         };
+        logAiChat("server _reply start", {
+          requestId: id,
+          continuation,
+          assistantMessageId,
+          initialMessageId: message.id,
+          currentMessages: summarizeMessages(this.messages)
+        });
         // Track the streaming message so tool results can be applied before persistence
         this._streamingMessage = message;
         // Set up completion promise for tool continuation to wait on
@@ -2274,7 +2665,8 @@ export class AIChatAgent<
               message,
               streamCompleted,
               continuation,
-              abortSignal
+              abortSignal,
+              assistantMessageId
             );
           } else {
             await this._sendPlaintextReply(
@@ -2333,6 +2725,22 @@ export class AIChatAgent<
         }
 
         if (message.parts.length > 0) {
+          logAiChat("server _reply pre-persist", {
+            requestId: id,
+            continuation,
+            assistantMessageId,
+            finalMessageId: message.id,
+            partTypes: message.parts.map((part) => part.type),
+            earlyPersistedId,
+            orphanPersistedMessageId: this._orphanPersistedMessageId,
+            currentMessages: summarizeMessages(this.messages)
+          });
+          // After a stream finishes, broadcast the canonical persisted message
+          // back to the initiating tab as well. Without this, the sender can
+          // keep a stale locally-assembled assistant message in React state
+          // and send it back on the next turn, diverging from server state.
+          const finalPersistBroadcastIds: string[] = [];
+
           if (earlyPersistedId) {
             // Message already exists in this.messages from the early persist.
             // Update it in place with the final streaming state.
@@ -2343,7 +2751,10 @@ export class AIChatAgent<
             const updatedMessages = this.messages.map((msg) =>
               msg.id === earlyPersistedId ? message : msg
             );
-            await this.persistMessages(updatedMessages, excludeBroadcastIds);
+            await this.persistMessages(
+              updatedMessages,
+              finalPersistBroadcastIds
+            );
           } else if (continuation) {
             // Find the last assistant message and append parts to it
             let lastAssistantIdx = -1;
@@ -2361,19 +2772,37 @@ export class AIChatAgent<
               };
               const updatedMessages = [...this.messages];
               updatedMessages[lastAssistantIdx] = mergedMessage;
-              await this.persistMessages(updatedMessages, excludeBroadcastIds);
+              await this.persistMessages(
+                updatedMessages,
+                finalPersistBroadcastIds
+              );
             } else {
               // No assistant message to append to, create new one
               await this.persistMessages(
                 [...this.messages, message],
-                excludeBroadcastIds
+                finalPersistBroadcastIds
               );
             }
           } else {
-            await this.persistMessages(
-              [...this.messages, message],
-              excludeBroadcastIds
-            );
+            // If _persistOrphanedStream ran during this stream (e.g. client
+            // reconnected mid-stream), it may have added a partial assistant
+            // message. Replace it with the completed message to avoid duplicates.
+            if (this._orphanPersistedMessageId && message.role === "assistant") {
+              const orphanId = this._orphanPersistedMessageId;
+              this._orphanPersistedMessageId = null;
+              const updatedMessages = this.messages.map((m) =>
+                m.id === orphanId ? message : m
+              );
+              await this.persistMessages(
+                updatedMessages,
+                finalPersistBroadcastIds
+              );
+            } else {
+              await this.persistMessages(
+                [...this.messages, message],
+                finalPersistBroadcastIds
+              );
+            }
           }
         }
       })
