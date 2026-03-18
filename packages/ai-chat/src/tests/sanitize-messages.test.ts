@@ -284,6 +284,111 @@ describe("Message Sanitization", () => {
     ws.close(1000);
   });
 
+  it("strips OpenRouter reasoning_details from tool callProviderMetadata", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    const messageWithToolMeta: ChatMessage = {
+      id: "msg-sanitize-openrouter-tool-meta",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-eval",
+          toolCallId: "call_openrouter_meta1",
+          toolName: "eval",
+          state: "output-available",
+          input: { code: "() => 1" },
+          output: "1",
+          callProviderMetadata: {
+            openrouter: {
+              reasoning_details: [
+                {
+                  type: "reasoning.text",
+                  text: "Think about the tool call",
+                  format: "anthropic-claude-v1",
+                  index: 0
+                }
+              ],
+              route: "anthropic"
+            }
+          }
+        }
+      ] as ChatMessage["parts"]
+    };
+
+    await agentStub.persistMessages([messageWithToolMeta]);
+
+    const persisted = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    const toolPart = persisted[0].parts[0] as {
+      callProviderMetadata?: {
+        openrouter?: Record<string, unknown>;
+      };
+    };
+
+    expect(toolPart.callProviderMetadata?.openrouter).toEqual({
+      route: "anthropic"
+    });
+
+    ws.close(1000);
+  });
+
+  it("drops reasoning parts from assistant messages that contain tool parts", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const agentStub = await getAgentByName(env.TestChatAgent, room);
+
+    const messageWithToolAndReasoning: ChatMessage = {
+      id: "msg-sanitize-tool-reasoning",
+      role: "assistant",
+      parts: [
+        {
+          type: "reasoning",
+          text: "Plan the tool call",
+          state: "done",
+          providerMetadata: {
+            openrouter: {
+              reasoning_details: [
+                {
+                  type: "reasoning.text",
+                  text: "Plan the tool call",
+                  format: "anthropic-claude-v1",
+                  index: 0,
+                  signature: "signed"
+                }
+              ]
+            }
+          }
+        },
+        { type: "text", text: "Let me check that." },
+        {
+          type: "tool-eval",
+          toolCallId: "call_tool_reasoning",
+          toolName: "eval",
+          state: "output-available",
+          input: { code: "() => 1" },
+          output: "1"
+        },
+        { type: "text", text: "The result is 1." }
+      ] as ChatMessage["parts"]
+    };
+
+    await agentStub.persistMessages([messageWithToolAndReasoning]);
+
+    const persisted = (await agentStub.getPersistedMessages()) as ChatMessage[];
+    expect(persisted[0].parts.map((part) => part.type)).toEqual([
+      "text",
+      "tool-eval",
+      "text"
+    ]);
+
+    ws.close(1000);
+  });
+
   it("preserves messages without OpenAI metadata unchanged", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);

@@ -14,6 +14,11 @@ import { nanoid } from "nanoid";
 import type { Connection } from "agents";
 import { MessageType } from "./types";
 
+function logAiChat(msg: string, extra: Record<string, unknown> = {}) {
+  console.info("[ai-chat]", msg, extra
+  );
+}
+
 /** Number of chunks to buffer before flushing to SQLite */
 const CHUNK_BUFFER_SIZE = 10;
 /** Maximum buffer size to prevent memory issues on rapid reconnections */
@@ -153,6 +158,11 @@ export class ResumableStream {
       values (${streamId}, ${requestId}, 'streaming', ${Date.now()})
     `;
 
+    logAiChat("resumable start", {
+      requestId,
+      streamId
+    });
+
     return streamId;
   }
 
@@ -172,6 +182,10 @@ export class ResumableStream {
     this._activeRequestId = null;
     this._streamChunkIndex = 0;
     this._isLive = false;
+
+    logAiChat("resumable complete", {
+      streamId
+    });
 
     // Periodically clean up old streams
     this._maybeCleanupOldStreams();
@@ -193,6 +207,10 @@ export class ResumableStream {
     this._activeRequestId = null;
     this._streamChunkIndex = 0;
     this._isLive = false;
+
+    logAiChat("resumable error", {
+      streamId
+    });
   }
 
   // ── Chunk storage ──────────────────────────────────────────────────
@@ -296,6 +314,14 @@ export class ResumableStream {
       order by chunk_index asc
     `;
 
+    logAiChat("resumable replayChunks", {
+      connectionId: connection.id,
+      requestId,
+      streamId,
+      chunkCount: chunks?.length ?? 0,
+      isLive: this._isLive
+    });
+
     for (const chunk of chunks || []) {
       connection.send(
         JSON.stringify({
@@ -338,6 +364,11 @@ export class ResumableStream {
         })
       );
       this.complete(streamId);
+      logAiChat("resumable replayChunks finalized orphan stream", {
+        connectionId: connection.id,
+        requestId,
+        streamId
+      });
       return streamId;
     }
 
@@ -401,6 +432,12 @@ export class ResumableStream {
         lastChunk && lastChunk[0]?.max_index != null
           ? lastChunk[0].max_index + 1
           : 0;
+      this._isLive = false;
+      logAiChat("resumable restore active stream", {
+        streamId: this._activeStreamId,
+        requestId: this._activeRequestId,
+        chunkIndex: this._streamChunkIndex
+      });
     }
   }
 

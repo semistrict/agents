@@ -12,8 +12,24 @@ import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OutgoingMessage } from "./types";
 import { MessageType } from "./types";
 import { applyChunkToParts, type MessageParts } from "./message-builder";
+import { deduplicateConsecutiveAssistants } from "./message-dedup";
 import { WebSocketChatTransport } from "./ws-chat-transport";
 import type { useAgent } from "agents/react";
+
+function summarizeMessages(messages: UIMessage[]) {
+  return messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    partTypes: message.parts.map((part) => part.type),
+    hasFinishReason: !!(
+      message.metadata as { finishReason?: unknown } | undefined
+    )?.finishReason
+  }));
+}
+
+function logAiChat(msg: string, extra: Record<string, unknown> = {}) {
+  console.info("[ai-chat]", msg, extra);
+}
 
 /**
  * One-shot deprecation warnings (warns once per key per session).
@@ -965,12 +981,35 @@ export function useAgentChat<
           ...(activeMsg.metadata != null && { metadata: activeMsg.metadata })
         } as unknown as ChatMessage;
 
+        logAiChat("react flushActiveStreamToMessages", {
+          streamRequestId: activeMsg.id,
+          assistantMessageId: activeMsg.messageId,
+          existingIdx,
+          prevCount: prevMessages.length,
+          partialPartTypes: partialMessage.parts.map((part) => part.type)
+        });
+
         if (existingIdx >= 0) {
           const updated = [...prevMessages];
           updated[existingIdx] = partialMessage;
-          return updated;
+          const normalized = deduplicateConsecutiveAssistants(updated);
+          logAiChat("react flushActiveStreamToMessages result", {
+            mode: "replace",
+            nextCount: normalized.length,
+            messages: summarizeMessages(normalized)
+          });
+          return normalized;
         }
-        return [...prevMessages, partialMessage];
+        const normalized = deduplicateConsecutiveAssistants([
+          ...prevMessages,
+          partialMessage
+        ]);
+        logAiChat("react flushActiveStreamToMessages result", {
+          mode: "append",
+          nextCount: normalized.length,
+          messages: summarizeMessages(normalized)
+        });
+        return normalized;
       });
     },
     [setMessages]
@@ -997,7 +1036,11 @@ export function useAgentChat<
           break;
 
         case MessageType.CF_AGENT_CHAT_MESSAGES:
-          setMessages(data.messages);
+          logAiChat("react received CF_AGENT_CHAT_MESSAGES", {
+            incomingCount: data.messages.length,
+            messages: summarizeMessages(data.messages)
+          });
+          setMessages(deduplicateConsecutiveAssistants(data.messages));
           break;
 
         case MessageType.CF_AGENT_MESSAGE_UPDATED:
@@ -1473,10 +1516,19 @@ export function useAgentChat<
         resolvedMessages = messagesOrUpdater;
       }
 
-      setMessages(resolvedMessages);
+      const normalizedMessages =
+        deduplicateConsecutiveAssistants(resolvedMessages);
+
+      logAiChat("react local setMessages", {
+        inputCount: resolvedMessages.length,
+        normalizedCount: normalizedMessages.length,
+        messages: summarizeMessages(normalizedMessages)
+      });
+
+      setMessages(normalizedMessages);
       agent.send(
         JSON.stringify({
-          messages: resolvedMessages,
+          messages: normalizedMessages,
           type: MessageType.CF_AGENT_CHAT_MESSAGES
         })
       );

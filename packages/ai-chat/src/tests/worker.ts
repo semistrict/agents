@@ -20,6 +20,7 @@ export type Env = {
   AgentWithSuperCall: DurableObjectNamespace<AgentWithSuperCall>;
   AgentWithoutSuperCall: DurableObjectNamespace<AgentWithoutSuperCall>;
   SlowStreamAgent: DurableObjectNamespace<SlowStreamAgent>;
+  StartEventAgent: DurableObjectNamespace<StartEventAgent>;
   WaitMcpTrueAgent: DurableObjectNamespace<WaitMcpTrueAgent>;
   WaitMcpTimeoutAgent: DurableObjectNamespace<WaitMcpTimeoutAgent>;
   WaitMcpFalseAgent: DurableObjectNamespace<WaitMcpFalseAgent>;
@@ -372,9 +373,17 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
     const chunkDelayMs = body?.chunkDelayMs ?? 50;
     const abortSignal = useAbortSignal ? options?.abortSignal : undefined;
 
+    const messageId = body?.messageId as string | undefined;
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async pull(controller) {
+        if (format === "sse" && messageId) {
+          const start = JSON.stringify({
+            type: "start",
+            messageId
+          });
+          controller.enqueue(encoder.encode(`data: ${start}\n\n`));
+        }
         for (let i = 0; i < chunkCount; i++) {
           if (abortSignal?.aborted) {
             controller.close();
@@ -396,6 +405,11 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
           }
         }
         if (format === "sse") {
+          const finish = JSON.stringify({
+            type: "finish",
+            finishReason: "stop"
+          });
+          controller.enqueue(encoder.encode(`data: ${finish}\n\n`));
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         }
         controller.close();
@@ -414,6 +428,71 @@ export class SlowStreamAgent extends AIChatAgent<Env> {
         _chatMessageAbortControllers: Map<string, unknown>;
       }
     )._chatMessageAbortControllers.size;
+  }
+}
+
+/**
+ * Test agent that returns SSE with a `start` event containing a messageId,
+ * followed by text chunks and [DONE]. Used to test that the temp-ID placeholder
+ * doesn't get persisted alongside the server-assigned messageId.
+ */
+export class StartEventAgent extends AIChatAgent<Env> {
+  async onChatMessage(
+    _onFinish: StreamTextOnFinishCallback<ToolSet>,
+    _options?: OnChatMessageOptions
+  ) {
+    const serverMessageId = `server-msg-${crypto.randomUUID()}`;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        // 1. Start event with server-assigned messageId
+        const startEvent = JSON.stringify({
+          type: "start",
+          messageId: serverMessageId
+        });
+        controller.enqueue(encoder.encode(`data: ${startEvent}\n\n`));
+
+        // 2. Text chunks
+        const textStart = JSON.stringify({ type: "text-start" });
+        controller.enqueue(encoder.encode(`data: ${textStart}\n\n`));
+
+        const delta1 = JSON.stringify({
+          type: "text-delta",
+          textDelta: "Hello "
+        });
+        controller.enqueue(encoder.encode(`data: ${delta1}\n\n`));
+
+        const delta2 = JSON.stringify({
+          type: "text-delta",
+          textDelta: "world!"
+        });
+        controller.enqueue(encoder.encode(`data: ${delta2}\n\n`));
+
+        const textEnd = JSON.stringify({ type: "text-end" });
+        controller.enqueue(encoder.encode(`data: ${textEnd}\n\n`));
+
+        // 3. Finish + DONE
+        const finish = JSON.stringify({ type: "finish" });
+        controller.enqueue(encoder.encode(`data: ${finish}\n\n`));
+
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    return new Response(stream, {
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+
+  getPersistedMessages(): ChatMessage[] {
+    const rawMessages = (
+      this.sql`select * from cf_ai_chat_agent_messages order by created_at` ||
+      []
+    ).map((row) => {
+      return JSON.parse(row.message as string);
+    });
+    return rawMessages;
   }
 }
 
